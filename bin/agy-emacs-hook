@@ -1,0 +1,27 @@
+#!/bin/sh
+# Forward an agy lifecycle hook to Emacs.
+#
+# Usage in hooks.json: agy-emacs-hook EVENT   (EVENT such as Stop)
+#
+# agy writes the hook payload as JSON on stdin and expects JSON on stdout.
+# Inside a session started by agy.el, AGY_BUFFER_NAME names the Emacs buffer;
+# the payload is handed to `agy-handle-hook' without waiting for Emacs.
+# Elsewhere the script does nothing.  It always answers {}, which lets agy
+# carry on as if no hook had run.
+
+event=$1
+payload=$(cat)
+
+case $event in
+  ''|*[!A-Za-z]*) echo '{}'; exit 0 ;;
+esac
+
+if [ -n "$AGY_BUFFER_NAME" ]; then
+  # Quote for an Emacs Lisp string literal: escape backslashes and quotes.
+  quote() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+  emacsclient --no-wait --eval \
+    "(agy-handle-hook \"$event\" \"$(quote "$AGY_BUFFER_NAME")\" \"$(quote "$payload")\")" \
+    >/dev/null 2>&1
+fi
+
+echo '{}'
