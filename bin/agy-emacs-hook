@@ -17,10 +17,11 @@ case $event in
 esac
 
 if [ -n "$AGY_BUFFER_NAME" ]; then
-  # Quote for an Emacs Lisp string literal: escape backslashes and quotes.
-  quote() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+  # Base64-encode arbitrary strings (including multiline JSON) so shell and
+  # Elisp string quoting can never break or drop characters.
+  b64() { printf '%s' "$1" | base64 | tr -d '\r\n'; }
   emacsclient --no-wait --eval \
-    "(agy-handle-hook \"$event\" \"$(quote "$AGY_BUFFER_NAME")\" \"$(quote "$payload")\")" \
+    "(agy-handle-hook \"$event\" (decode-coding-string (base64-decode-string \"$(b64 "$AGY_BUFFER_NAME")\") 'utf-8) (decode-coding-string (base64-decode-string \"$(b64 "$payload")\") 'utf-8))" \
     >/dev/null 2>&1
 fi
 

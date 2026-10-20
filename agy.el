@@ -29,6 +29,8 @@
 
 (require 'cl-lib)
 (require 'project)
+(require 'seq)
+(require 'subr-x)
 (require 'transient)
 (require 'inheritenv)
 
@@ -234,7 +236,8 @@ agy event name, such as \"Stop\"), :buffer (the agy buffer, or nil) and
   (require 'eat)
   (with-current-buffer buffer
     (eat-mode))
-  (eat-exec buffer (buffer-name buffer) program nil switches))
+  (inheritenv
+    (eat-exec buffer (buffer-name buffer) program nil switches)))
 
 (cl-defmethod agy--term-send ((_backend (eql eat)) string)
   "Send STRING to the eat terminal."
@@ -342,7 +345,7 @@ and remember the choice.  Return nil when no session is running."
   (let ((buffer (make-symbol "buffer")))
     `(let ((,buffer (agy--require-buffer)))
        (with-current-buffer ,buffer ,@body)
-       (display-buffer ,buffer)
+       (agy--show ,buffer)
        ,buffer)))
 
 (defun agy--read-instance-name (dir existing force)
@@ -475,12 +478,14 @@ With prefix ARG, prompt for the directory."
     ORDER BY last_modified_time DESC"
   "SQL listing resumable top-level conversations, newest first.")
 
+(declare-function iso8601-parse "iso8601" (string &optional form))
 (declare-function url-unhex-string "url-util" (str &optional allow-newlines))
 
 (defun agy--conversations ()
   "Resumable agy conversations as plists, newest first.
 Each has :id, :title, :time (a Lisp timestamp) and :dirs (workspace
 directories)."
+  (require 'iso8601)
   (require 'url-util)
   (let ((db (expand-file-name "conversation_summaries.db" agy-data-directory)))
     (unless (file-exists-p db)
@@ -495,32 +500,52 @@ directories)."
       (unless (eobp)
         (mapcar
          (lambda (row)
-           (list :id (plist-get row :id)
-                 :title (let ((title (plist-get row :title)))
-                          (if (string-empty-p title) (plist-get row :preview) title))
-                 :time (encode-time
-                        (iso8601-parse
-                         (string-replace " " "T" (plist-get row :time))))
-                 :dirs (mapcar (lambda (uri)
-                                 (file-name-as-directory
-                                  (url-unhex-string (string-remove-prefix "file://" uri))))
-                               (json-parse-string (plist-get row :workspaces)
-                                                  :array-type 'list))))
-         (json-parse-buffer :object-type 'plist :array-type 'list))))))
+           (let* ((id (or (plist-get row :id) ""))
+                  (title (string-trim (or (plist-get row :title) "")))
+                  (preview (string-trim (or (plist-get row :preview) "")))
+                  (raw-time (plist-get row :time))
+                  (raw-ws (plist-get row :workspaces)))
+             (list :id id
+                   :title (cond ((not (string-empty-p title)) title)
+                                ((not (string-empty-p preview)) preview)
+                                (t "(untitled)"))
+                   :time (or (and (stringp raw-time)
+                                  (ignore-errors
+                                    (encode-time
+                                     (iso8601-parse
+                                      (string-replace " " "T" raw-time)))))
+                             (encode-time 0 0 0 1 1 1970 t))
+                   :dirs (mapcar (lambda (uri)
+                                   (file-name-as-directory
+                                    (url-unhex-string
+                                     (string-remove-prefix "file://" uri))))
+                                 (and (stringp raw-ws)
+                                      (ignore-errors
+                                        (json-parse-string raw-ws
+                                                           :array-type 'list
+                                                           :null-object nil)))))))
+         (json-parse-buffer :object-type 'plist :array-type 'list
+                            :null-object nil :false-object nil))))))
 
 (defun agy--read-conversation (conversations)
   "Ask which of CONVERSATIONS to resume and return its plist."
   (let* ((choices
           (mapcar (lambda (conv)
-                    (cons (format "%s  %s  %s"
-                                  (format-time-string "%F %R" (plist-get conv :time))
-                                  (truncate-string-to-width
-                                   (string-replace "\n" " " (plist-get conv :title))
-                                   60 nil nil "…")
-                                  (propertize (abbreviate-file-name
-                                               (or (car (plist-get conv :dirs)) ""))
-                                              'face 'shadow))
-                          conv))
+                    (let ((id (or (plist-get conv :id) "")))
+                      (cons (format "%s  %s  %s%s"
+                                    (format-time-string "%F %R" (plist-get conv :time))
+                                    (truncate-string-to-width
+                                     (string-replace "\n" " " (plist-get conv :title))
+                                     60 nil nil "…")
+                                    (propertize (abbreviate-file-name
+                                                 (or (car (plist-get conv :dirs)) ""))
+                                                'face 'shadow)
+                                    (if (string-empty-p id)
+                                        ""
+                                      (propertize (format "  %s"
+                                                          (substring id 0 (min 8 (length id))))
+                                                  'face 'shadow)))
+                            conv)))
                   conversations))
          (table (lambda (string pred action)
                   (if (eq action 'metadata)
@@ -554,6 +579,14 @@ The session starts in the conversation's own workspace."
 
 ;;;;; Models
 
+(defun agy--parse-models (output)
+  "Parse `agy models' OUTPUT into an alist of (ID . DESCRIPTION)."
+  (cl-loop for raw-line in (split-string output "\n" t)
+           for line = (replace-regexp-in-string "\\`.*\r" "" raw-line)
+           when (string-match "\\`\\([[:alnum:]][[:alnum:]._-]*\\)\\(?:\t+\\|  +\\)\\([^[:space:]].*\\)\\'"
+                              line)
+           collect (cons (match-string 1 line) (string-trim-right (match-string 2 line)))))
+
 (defun agy--models ()
   "Models agy offers, as an alist of (ID . DESCRIPTION)."
   (or agy--models-cache
@@ -561,9 +594,8 @@ The session starts in the conversation's own workspace."
             (with-temp-buffer
               (unless (zerop (call-process agy-program nil '(t nil) nil "models"))
                 (user-error "`%s models' failed" agy-program))
-              (cl-loop for line in (split-string (buffer-string) "\n" t)
-                       when (string-match "\\`\\([^\t ]+\\)\t\\(.+\\)\\'" line)
-                       collect (cons (match-string 1 line) (match-string 2 line)))))))
+              (or (agy--parse-models (buffer-string))
+                  (user-error "No models returned by `%s models'" agy-program))))))
 
 (defun agy--read-model (prompt &optional initial-input history)
   "Read an agy model id with PROMPT, INITIAL-INPUT and HISTORY."
@@ -581,24 +613,24 @@ A trailing @path leaves agy's file-completion menu open, and the menu
 would take the RET that submits the prompt."
   (if (string-match-p "@[^[:space:]]+\\'" text) (concat text " ") text))
 
-(defun agy--submit (buffer text)
+(defun agy--submit (buffer text &optional select)
   "Paste TEXT at the agy prompt in BUFFER and submit it.
-Empty TEXT just sends RET.  BUFFER is displayed afterwards."
+Empty TEXT just sends RET.  BUFFER is displayed afterwards, and
+selected if SELECT is non-nil."
   (with-current-buffer buffer
     (unless (string-empty-p text)
       (agy--term-paste agy--backend (agy--close-mention text))
-      ;; Let agy take in the paste before RET arrives.
-      (sit-for 0.1))
+      ;; Wait for agy to process the bracketed paste before sending RET;
+      ;; `sleep-for' is used rather than `sit-for' so pending keystrokes
+      ;; do not cut the pause short.
+      (sleep-for 0.1))
     (agy--term-send agy--backend "\r"))
-  (display-buffer buffer)
+  (agy--show buffer select)
   buffer)
 
 (defun agy--send-to-session (text &optional select)
   "Submit TEXT to the current agy session; select its window if SELECT."
-  (let ((buffer (agy--submit (agy--require-buffer) text)))
-    (when select
-      (pop-to-buffer buffer))
-    buffer))
+  (agy--submit (agy--require-buffer) text select))
 
 (defun agy--send-key (string)
   "Send STRING as raw keystrokes to the current agy session."
@@ -680,17 +712,28 @@ also switch to the agy buffer."
 (declare-function flycheck-error-filename "flycheck" (err))
 (declare-function flycheck-error-line "flycheck" (err))
 (declare-function flycheck-error-message "flycheck" (err))
+(declare-function flymake-diagnostics "flymake" (&optional beg end))
+(declare-function flymake-diagnostic-text "flymake" (diag))
 
 (defun agy--errors-at-point ()
-  "Flycheck errors at point, else flymake's help text, as a string or nil."
-  (if (bound-and-true-p flycheck-mode)
-      (when-let* ((errors (flycheck-overlay-errors-at (point))))
-        (mapconcat (lambda (err)
-                     (format "%s:%d: %s" (flycheck-error-filename err)
-                             (flycheck-error-line err) (flycheck-error-message err)))
-                   errors "\n"))
-    (when-let* ((help (help-at-pt-kbd-string)))
-      (substring-no-properties help))))
+  "Flycheck or Flymake diagnostics at point, as a string or nil."
+  (cond
+   ((when-let* (((bound-and-true-p flycheck-mode))
+                (errors (flycheck-overlay-errors-at (point))))
+      (mapconcat (lambda (err)
+                   (format "%s:%d: %s"
+                           (or (flycheck-error-filename err)
+                               (agy--file-name)
+                               (buffer-name))
+                           (or (flycheck-error-line err)
+                               (line-number-at-pos (point) t))
+                           (flycheck-error-message err)))
+                 errors "\n")))
+   ((when-let* (((bound-and-true-p flymake-mode))
+                (diags (flymake-diagnostics (point))))
+      (mapconcat #'flymake-diagnostic-text diags "\n")))
+   ((when-let* ((help (help-at-pt-kbd-string)))
+      (substring-no-properties help)))))
 
 ;;;###autoload
 (defun agy-fix-error-at-point (&optional arg)
@@ -889,12 +932,14 @@ the selected window of a focused frame."
     (funcall agy-notification-function "agy"
              (format "%s is waiting for you" (buffer-name buffer)))))
 
+(declare-function json-pretty-print-buffer "json" (&optional minimize))
+
 (defun agy-handle-hook (event buffer-name &optional json)
   "Handle agy lifecycle hook EVENT from the session in BUFFER-NAME.
 JSON is the payload agy passed the hook.  The bridge script
 bin/agy-emacs-hook calls this through emacsclient; see
 `agy-install-hooks'.  Run `agy-event-functions', then notify on a
-\"Stop\" the user did not cause by cancelling."
+\"Stop\" when the session is fully idle and was not cancelled by the user."
   (let ((buffer (get-buffer buffer-name))
         (data (and json
                    (ignore-errors
@@ -904,7 +949,9 @@ bin/agy-emacs-hook calls this through emacsclient; see
                         (list :event event :buffer buffer :data data))
     (when (and buffer
                (equal event "Stop")
-               (not (equal (plist-get data :terminationReason) "USER_CANCELED")))
+               (not (equal (plist-get data :terminationReason) "USER_CANCELED"))
+               (or (not (plist-member data :fullyIdle))
+                   (plist-get data :fullyIdle)))
       (agy--notify buffer))
     nil))
 
@@ -922,6 +969,7 @@ emacsclient, so Emacs hears when a turn ends.  It does nothing in agy
 sessions started outside Emacs.  Other hooks in the file are kept; the
 bridge is the entry named \"agy-el\"."
   (interactive)
+  (require 'json)
   (let* ((file (expand-file-name agy-hooks-file))
          (config (with-temp-buffer
                    (when (file-exists-p file)
@@ -931,10 +979,10 @@ bridge is the entry named \"agy-el\"."
                        nil
                      (json-parse-buffer :object-type 'alist
                                         :null-object :null :false-object :false)))))
-    (setf (alist-get 'agy-el config)
-          `((Stop . [((type . "command")
-                      (command . ,(agy--hook-command "Stop"))
-                      (timeout . 5))])))
+    (setf (alist-get 'Stop (alist-get 'agy-el config))
+          `[((type . "command")
+             (command . ,(agy--hook-command "Stop"))
+             (timeout . 5))])
     (make-directory (file-name-directory file) t)
     (with-temp-file file
       (insert (json-serialize config :null-object :null :false-object :false))
@@ -972,11 +1020,12 @@ The start options apply to sessions started from this menu."
    ("-s" "Sandbox" "--sandbox")
    ("-y" "Skip permission prompts" "--dangerously-skip-permissions")]
   [["Start / stop"
-    ("c" "Start agy" agy)
+    ("a" "Start agy" agy)
     ("d" "Start in directory" agy-start-in-directory)
     ("C" "Continue last conversation" agy-continue)
     ("R" "Resume conversation" agy-resume)
     ("i" "New instance" agy-new-instance)
+    ("S" "Start sandboxed" agy-sandbox)
     ("k" "Kill session" agy-kill)
     ("K" "Kill all sessions" agy-kill-all)]
    ["Send"
@@ -984,6 +1033,7 @@ The start options apply to sessions started from this menu."
     ("x" "Prompt with file context" agy-send-command-with-context)
     ("r" "Region or buffer" agy-send-region)
     ("o" "This buffer's file" agy-send-buffer-file)
+    ("f" "File by path" agy-send-file)
     ("e" "Fix error at point" agy-fix-error-at-point)
     ("v" "Paste clipboard image" agy-paste-image)
     ("/" "Slash commands" agy-slash-commands)]
@@ -1047,6 +1097,7 @@ The start options apply to sessions started from this menu."
   "x" #'agy-send-command-with-context
   "r" #'agy-send-region
   "o" #'agy-send-buffer-file
+  "f" #'agy-send-file
   "e" #'agy-fix-error-at-point
   "v" #'agy-paste-image
   "/" #'agy-slash-commands
