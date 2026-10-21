@@ -373,12 +373,11 @@ unnamed first instance, when EXISTING is empty and FORCE is nil."
   (display-buffer buffer '((display-buffer-below-selected))))
 
 (defun agy--show (buffer &optional select)
-  "Display agy BUFFER with `agy-display-window-fn'; select it if SELECT.
-Selection also happens when `agy-toggle-auto-select' is non-nil."
+  "Display agy BUFFER with `agy-display-window-fn'; select it if SELECT."
   (when-let* ((window (funcall agy-display-window-fn buffer)))
     (set-window-parameter window 'no-delete-other-windows
                           agy-no-delete-other-windows)
-    (when (or select agy-toggle-auto-select)
+    (when select
       (select-window window))
     window))
 
@@ -409,17 +408,20 @@ SELECT non-nil selects the new window."
          (process-adaptive-read-buffering nil)
          (buffer (generate-new-buffer name)))
     ;; Display first: the terminal takes its size from the window.
-    (agy--show buffer select)
-    (agy--term-make backend buffer agy-program switches)
-    (with-current-buffer buffer
-      (setq-local agy--directory dir
-                  agy--instance instance
-                  agy--backend backend)
-      (agy--term-configure backend)
-      (agy-session-mode 1)
-      (face-remap-add-relative 'nobreak-space :underline nil)
-      (add-hook 'kill-buffer-hook #'agy--forget-buffer nil t)
-      (run-hooks 'agy-start-hook))
+    (let ((window (agy--show buffer)))
+      (agy--term-make backend buffer agy-program switches)
+      (with-current-buffer buffer
+        (setq-local agy--directory dir
+                    agy--instance instance
+                    agy--backend backend)
+        (agy--term-configure backend)
+        (agy-session-mode 1)
+        (face-remap-add-relative 'nobreak-space :underline nil)
+        (add-hook 'kill-buffer-hook #'agy--forget-buffer nil t)
+        (run-hooks 'agy-start-hook))
+      (when (and (or select agy-toggle-auto-select)
+                 (window-live-p window))
+        (select-window window)))
     buffer))
 
 (defun agy--forget-buffer ()
@@ -827,7 +829,7 @@ With PROMPT, the command reads an argument with it and appends it."
     (if-let* ((window (get-buffer-window buffer)))
         ;; Unlike `delete-window', this also copes with a sole window.
         (quit-window nil window)
-      (agy--show buffer))))
+      (agy--show buffer agy-toggle-auto-select))))
 
 ;;;###autoload
 (defun agy-switch-to-buffer (&optional arg)
